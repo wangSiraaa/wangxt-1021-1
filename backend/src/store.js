@@ -32,7 +32,16 @@ class DataStore {
       entry_record: [],
       closure_record: [],
       refund_record: [],
-      exception_record: []
+      exception_record: [],
+      waitlist: [],
+      batch_entry: [],
+      addon_service: [],
+      addon_order: [],
+      reschedule_record: [],
+      family_member: [],
+      weight_adjust_log: [],
+      on_site_extra: [],
+      state_sync_log: []
     };
   }
 
@@ -101,6 +110,15 @@ class DataStore {
     this.data[tableName].splice(idx, 1);
     this.save();
     return true;
+  }
+
+  deleteWhere(tableName, predicate) {
+    if (!this.data[tableName]) return 0;
+    const before = this.data[tableName].length;
+    this.data[tableName] = this.data[tableName].filter(r => !predicate(r));
+    const deleted = before - this.data[tableName].length;
+    if (deleted > 0) this.save();
+    return deleted;
   }
 
   _now() {

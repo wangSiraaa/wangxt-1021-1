@@ -1,7 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const store = require('../store');
-const { nowDateTime, tryCalcRefund, releaseLockedWeight, fullyReleaseLockedWeight, calcSlotAvailableWeight, tryLockWeight } = require('../utils');
+const {
+  nowDateTime, tryCalcRefund, releaseLockedWeight, fullyReleaseLockedWeight,
+  calcSlotAvailableWeight, tryLockWeight, syncStateToAll
+} = require('../utils');
 
 function genNo(prefix) {
   const ts = Date.now();
@@ -367,6 +370,468 @@ router.post('/release-lock', (req, res) => {
     }
   }
   res.json({ code: 0, data: { reservation_id, released_weight: released, reason: reason || '' } });
+});
+
+// 家庭成员单独签到
+router.post('/family/checkin', (req, res) => {
+  const { reservation_id, member_ids, member_name, member_idcard, operator } = req.body;
+  if (!reservation_id) return res.json({ code: 400, message: '预约ID必填' });
+
+  const reservation = store.getById('reservation', Number(reservation_id));
+  if (!reservation) return res.json({ code: 404, message: '预约不存在' });
+  if (reservation.status !== 'CONFIRMED') {
+    return res.json({ code: 400, message: `预约状态${reservation.status}，无法签到` });
+  }
+
+  const now = nowDateTime();
+  let checkedIn = [];
+
+  if (member_ids && Array.isArray(member_ids) && member_ids.length > 0) {
+    for (const mid of member_ids) {
+      const m = store.getById('family_member', Number(mid));
+      if (m && m.reservation_id === Number(reservation_id) && m.checkin_status === 'PENDING') {
+        store.update('family_member', Number(mid), {
+          checkin_status: 'CHECKED_IN',
+          checkin_time: now,
+          checkin_operator: operator || 'onsite'
+        });
+        checkedIn.push(m.id);
+      }
+    }
+  } else if (member_name || member_idcard) {
+    const list = store.find('family_member', f => f.reservation_id === Number(reservation_id));
+    let matched = list.find(f =>
+      (member_idcard && f.member_idcard === member_idcard) ||
+      (member_name && f.member_name === member_name)
+    );
+    if (!matched) {
+      matched = store.insert('family_member', {
+        reservation_id: Number(reservation_id),
+        visitor_phone: reservation.visitor_phone,
+        member_name: member_name || '临时成员',
+        member_idcard: member_idcard || '',
+        relation: 'TEMP',
+        age_group: 'ADULT',
+        checkin_status: 'CHECKED_IN',
+        checkin_time: now,
+        checkin_operator: operator || 'onsite',
+        created_at: now
+      });
+    } else if (matched.checkin_status === 'PENDING') {
+      store.update('family_member', matched.id, {
+        checkin_status: 'CHECKED_IN',
+        checkin_time: now,
+        checkin_operator: operator || 'onsite'
+      });
+    }
+    checkedIn.push(matched.id);
+  } else {
+    return res.json({ code: 400, message: 'member_ids或member_name/member_idcard必填其一' });
+  }
+
+  const all = store.find('family_member', f => f.reservation_id === Number(reservation_id));
+  const totalCheckedIn = all.filter(f => f.checkin_status === 'CHECKED_IN').length;
+  const arrivalRate = all.length > 0 ? totalCheckedIn / all.length : null;
+
+  syncStateToAll(Number(reservation_id), 'FAMILY_CHECKIN', operator || 'onsite');
+
+  res.json({ code: 0, data: {
+    checked_in_ids: checkedIn,
+    checked_count: checkedIn.length,
+    total_checked_in: totalCheckedIn,
+    total_members: all.length,
+    arrival_rate: arrivalRate
+  }});
+});
+
+// 分批入园核销(团体客)
+router.post('/batch-entry', (req, res) => {
+  const {
+    reservation_id, batch_name, batch_count, remark,
+    checked_by, operator
+  } = req.body;
+
+  if (!reservation_id) return res.json({ code: 400, message: '预约ID必填' });
+  const bc = Number(batch_count);
+  if (!bc || bc <= 0) return res.json({ code: 400, message: '批次人数必须>0' });
+
+  const reservation = store.getById('reservation', Number(reservation_id));
+  if (!reservation) return res.json({ code: 404, message: '预约不存在' });
+  if (reservation.status !== 'CONFIRMED') {
+    return res.json({ code: 400, message: `预约状态${reservation.status}，无法分批入园` });
+  }
+
+  const slot = store.getById('time_slot', reservation.slot_id);
+  if (!slot) return res.json({ code: 404, message: '时段不存在' });
+  if (slot.status === 'CLOSURE') {
+    return res.json({ code: 4102, message: '该时段已闭园' });
+  }
+
+  const batches = store.find('batch_entry', b =>
+    b.reservation_id === Number(reservation_id)
+  );
+  const alreadyIn = batches.reduce((s, b) => s + (b.entry_status !== 'LEFT' ? b.batch_count : 0), 0);
+  const leftCapacity = reservation.group_size - alreadyIn;
+
+  if (bc > leftCapacity) {
+    return res.json({ code: 400, message: `剩余可分配人数${leftCapacity}，当前批次${bc}人超限` });
+  }
+
+  const existing = store.findOne('entry_record', e =>
+    e.reservation_id === Number(reservation_id) && e.entry_status !== 'LEFT'
+  );
+
+  let entry = existing;
+  if (!existing) {
+    const ticket = store.getById('picking_ticket', reservation.ticket_id);
+    entry = store.insert('entry_record', {
+      entry_no: genNo('EN'),
+      reservation_id: Number(reservation_id),
+      visitor_phone: reservation.visitor_phone,
+      group_size: reservation.group_size,
+      slot_id: reservation.slot_id,
+      slot_date: slot.slot_date,
+      slot_start: slot.slot_start,
+      slot_end: slot.slot_end,
+      ticket_id: reservation.ticket_id,
+      included_weight: reservation.included_weight,
+      extra_weight_limit: reservation.extra_weight_limit,
+      entry_time: nowDateTime(),
+      entry_status: 'IN_GARDEN',
+      actual_picked_weight: 0,
+      picking_progress: 0,
+      checked_by: checked_by || operator || '现场人员',
+      operator: operator || '现场人员',
+      is_batch_entry: 1
+    });
+    store.update('time_slot', reservation.slot_id, {
+      entered_count: (slot.entered_count || 0) + bc
+    });
+  } else {
+    store.update('time_slot', reservation.slot_id, {
+      entered_count: (slot.entered_count || 0) + bc
+    });
+  }
+
+  const batchEntry = store.insert('batch_entry', {
+    batch_no: genNo('BE'),
+    reservation_id: Number(reservation_id),
+    entry_record_id: entry.id,
+    batch_name: batch_name || `第${batches.length + 1}批`,
+    batch_count: bc,
+    entry_status: 'IN_GARDEN',
+    entry_time: nowDateTime(),
+    leave_time: null,
+    remark: remark || '',
+    checked_by: checked_by || operator || '现场人员',
+    operator: operator || '现场人员'
+  });
+
+  syncStateToAll(Number(reservation_id), 'BATCH_ENTRY', operator || 'onsite');
+
+  res.json({ code: 0, data: {
+    batch_entry: batchEntry,
+    entry_record: entry,
+    already_in_count: alreadyIn + bc,
+    remaining_count: leftCapacity - bc,
+    total_capacity: reservation.group_size
+  }});
+});
+
+// 分批离园
+router.post('/batch-entry/:id/leave', (req, res) => {
+  const id = Number(req.params.id);
+  const { actual_picked_weight, picking_progress, operator } = req.body;
+  const batch = store.getById('batch_entry', id);
+  if (!batch) return res.json({ code: 404, message: '批次不存在' });
+  if (batch.entry_status === 'LEFT') {
+    return res.json({ code: 400, message: '该批次已离园' });
+  }
+
+  const now = nowDateTime();
+  store.update('batch_entry', id, {
+    entry_status: 'LEFT',
+    leave_time: now,
+    operator: operator || batch.operator
+  });
+
+  const slot = store.getById('time_slot', store.getById('batch_entry', id).slot_id ||
+    store.getById('entry_record', batch.entry_record_id)?.slot_id || 0);
+  if (slot) {
+    store.update('time_slot', slot.id, {
+      entered_count: Math.max(0, (slot.entered_count || 0) - batch.batch_count)
+    });
+  }
+
+  const batches = store.find('batch_entry', b =>
+    b.reservation_id === batch.reservation_id
+  );
+  const allLeft = batches.every(b => b.entry_status === 'LEFT');
+
+  if (allLeft && actual_picked_weight != null) {
+    const entry = store.getById('entry_record', batch.entry_record_id);
+    if (entry && entry.entry_status !== 'LEFT') {
+      store.update('entry_record', entry.id, {
+        actual_picked_weight: Number(actual_picked_weight) || 0,
+        picking_progress: Number(picking_progress) || 0,
+        entry_status: 'LEFT',
+        leave_time: now,
+        operator: operator || entry.operator
+      });
+    }
+  }
+
+  syncStateToAll(batch.reservation_id, 'BATCH_LEAVE', operator || 'onsite');
+
+  res.json({ code: 0, data: {
+    batch_id: id,
+    all_batches_left: allLeft,
+    remaining_batches: batches.filter(b => b.entry_status !== 'LEFT').length
+  }});
+});
+
+// 离园精细化结算(含部分采摘/超额/加购/成员到场率)
+router.post('/entry/:id/final-settle', (req, res) => {
+  const id = Number(req.params.id);
+  const {
+    actual_picked_weight,
+    extra_weight_price,
+    damage_charge,
+    damage_reason,
+    operator,
+    auto_refund
+  } = req.body;
+
+  const entry = store.getById('entry_record', id);
+  if (!entry) return res.json({ code: 404, message: '入园记录不存在' });
+  if (entry.entry_status === 'LEFT' && entry.final_settled) {
+    return res.json({ code: 400, message: '已完成最终结算' });
+  }
+
+  const reservation = store.getById('reservation', entry.reservation_id);
+  if (!reservation) return res.json({ code: 404, message: '预约不存在' });
+
+  const slot = store.getById('time_slot', reservation.slot_id);
+  const ticket = store.getById('picking_ticket', reservation.ticket_id);
+  const now = nowDateTime();
+
+  const apw = actual_picked_weight != null ? Number(actual_picked_weight) : (entry.actual_picked_weight || 0);
+  const included = reservation.included_weight || 0;
+  const extraLimit = reservation.extra_weight_limit || 0;
+
+  let extraWeightCharge = 0;
+  if (apw > included) {
+    const overWeight = apw - included;
+    if (overWeight > extraLimit + 0.01) {
+      return res.json({ code: 400, message: `超量${overWeight.toFixed(1)}斤，超过允许超限${extraLimit.toFixed(1)}斤` });
+    }
+    const pricePerKg = Number(extra_weight_price) || (ticket?.extra_price_per_kg || 20);
+    extraWeightCharge = Math.round(overWeight * pricePerKg * 100) / 100;
+  }
+
+  const family = store.find('family_member', f => f.reservation_id === reservation.id);
+  const memberArrivalRate = family.length > 0
+    ? family.filter(f => f.checkin_status === 'CHECKED_IN').length / family.length
+    : null;
+
+  const onSiteExtra = store.findOne('on_site_extra', o => o.reservation_id === reservation.id);
+  const addonCost = onSiteExtra?.addon_cost || 0;
+  const damageCharge = Number(damage_charge) || (onSiteExtra?.damage_charge || 0);
+
+  if (extraWeightCharge > 0 || damageCharge > 0) {
+    if (onSiteExtra) {
+      store.update('on_site_extra', onSiteExtra.id, {
+        extra_weight_charge: extraWeightCharge,
+        damage_charge: damageCharge,
+        damage_reason: damage_reason || '',
+        updated_at: now
+      });
+    } else {
+      store.insert('on_site_extra', {
+        reservation_id: reservation.id,
+        visitor_phone: reservation.visitor_phone,
+        addon_cost: addonCost,
+        extra_weight_charge: extraWeightCharge,
+        damage_charge: damageCharge,
+        damage_reason: damage_reason || '',
+        created_at: now,
+        updated_at: now
+      });
+    }
+  }
+
+  const refundCalc = tryCalcRefund(reservation.id, 'EARLY_LEAVE', {
+    actualPickedWeight: apw,
+    memberArrivalRate,
+    extraWeightCharge,
+    damageCharge,
+    damageReason: damage_reason || ''
+  });
+  if (!refundCalc.success) {
+    return res.json({ code: 400, message: refundCalc.message, data: refundCalc });
+  }
+
+  if (auto_refund !== false) {
+    store.update('entry_record', id, {
+      actual_picked_weight: apw,
+      picking_progress: Math.round(apw / Math.max(0.01, reservation.estimated_weight || 1) * 100),
+      entry_status: 'LEFT',
+      leave_time: now,
+      final_settled: 1,
+      operator: operator || entry.operator
+    });
+
+    if (reservation.lock_details) {
+      try {
+        const releaseResult = releaseLockedWeight(reservation.slot_id, reservation.id, apw);
+        if (!releaseResult.success) {
+          fullyReleaseLockedWeight(reservation.slot_id, JSON.parse(reservation.lock_details));
+        }
+      } catch (e) {
+        console.warn('锁量释放异常:', e.message);
+      }
+    }
+
+    store.update('reservation', reservation.id, {
+      status: 'COMPLETED',
+      completed_at: now,
+      refund_amount: refundCalc.total_refund,
+      actual_picked_weight: apw
+    });
+
+    if (slot) {
+      store.update('time_slot', slot.id, {
+        entered_count: Math.max(0, (slot.entered_count || 0) - reservation.group_size)
+      });
+    }
+
+    store.updateWhere('deposit_record', d => d.reservation_id === reservation.id && d.status === 'HELD', {
+      status: refundCalc.deposit_refund > 0.01 ? 'REFUNDED' :
+              (refundCalc.total_deduction > 0.01 ? 'DEDUCTED' : 'RETURNED'),
+      remaining_amount: Math.max(0, refundCalc.deposit_refund),
+      refunded_amount: refundCalc.deposit_refund,
+      deducted_amount: refundCalc.total_deduction,
+      settled_at: now
+    });
+
+    store.insert('refund_record', {
+      refund_no: genNo('RF'),
+      reservation_id: reservation.id,
+      visitor_phone: reservation.visitor_phone,
+      original_ticket_amount: refundCalc.original_ticket_amount,
+      original_deposit_amount: refundCalc.original_deposit_amount,
+      ticket_refund: refundCalc.ticket_refund,
+      deposit_refund: refundCalc.deposit_refund,
+      total_refund: refundCalc.total_refund,
+      total_deduction: refundCalc.total_deduction,
+      refund_reason: refundCalc.refund_reason,
+      refund_rate: refundCalc.refund_rate,
+      picking_progress: refundCalc.picking_progress,
+      deduction_detail: JSON.stringify(refundCalc.deduction_detail),
+      refund_status: 'PROCESSED',
+      processed_at: now,
+      operator: operator || 'system',
+      supplement_info: JSON.stringify(refundCalc.supplement_info || null),
+      member_adjust_rate: refundCalc.member_adjust_rate || null
+    });
+
+    syncStateToAll(reservation.id, 'FINAL_SETTLE', operator || 'onsite');
+  }
+
+  res.json({ code: 0, data: {
+    reservation_id: reservation.id,
+    entry_id: id,
+    actual_picked_weight: apw,
+    included_weight: included,
+    extra_weight: Math.max(0, apw - included),
+    extra_weight_charge: extraWeightCharge,
+    addon_cost: addonCost,
+    damage_charge: damageCharge,
+    member_arrival_rate: memberArrivalRate,
+    member_adjust_rate: refundCalc.member_adjust_rate || null,
+    refund_calc: refundCalc,
+    auto_applied: auto_refund !== false,
+    supplement_needed: !!(refundCalc.supplement_info),
+    settlement_rule_hit: refundCalc.rule_hit || null
+  }});
+});
+
+// 三端状态拉取(现场核销简化版)
+router.get('/reservation/:id/onsite-state', (req, res) => {
+  const id = Number(req.params.id);
+  const reservation = store.getById('reservation', id);
+  if (!reservation) return res.json({ code: 404, message: '预约不存在' });
+
+  const ticket = store.getById('picking_ticket', reservation.ticket_id);
+  const slot = store.getById('time_slot', reservation.slot_id);
+  const entry = store.findOne('entry_record', e => e.reservation_id === id && e.entry_status !== 'LEFT');
+  const batches = store.find('batch_entry', b => b.reservation_id === id);
+  const family = store.find('family_member', f => f.reservation_id === id);
+  const extra = store.findOne('on_site_extra', o => o.reservation_id === id);
+  const addons = store.find('addon_order', a => a.reservation_id === id);
+
+  const checkedIn = family.filter(f => f.checkin_status === 'CHECKED_IN').length;
+  const inGarden = batches.filter(b => b.entry_status === 'IN_GARDEN');
+
+  res.json({ code: 0, data: {
+    reservation: {
+      id: reservation.id,
+      reservation_no: reservation.reservation_no,
+      status: reservation.status,
+      visitor_name: reservation.visitor_name,
+      visitor_phone: reservation.visitor_phone,
+      group_size: reservation.group_size,
+      estimated_weight: reservation.estimated_weight,
+      included_weight: reservation.included_weight,
+      extra_weight_limit: reservation.extra_weight_limit,
+      deposit_amount: reservation.deposit_amount
+    },
+    ticket: ticket ? {
+      ticket_code: ticket.ticket_code,
+      ticket_name: ticket.ticket_name,
+      ticket_type: ticket.ticket_type,
+      extra_price_per_kg: ticket.extra_price_per_kg
+    } : null,
+    slot: slot ? {
+      slot_date: slot.slot_date,
+      slot_label: slot.slot_label,
+      status: slot.status,
+      limit_reason: slot.limit_reason
+    } : null,
+    entry: entry ? {
+      entry_no: entry.entry_no,
+      entry_status: entry.entry_status,
+      entry_time: entry.entry_time,
+      actual_picked_weight: entry.actual_picked_weight,
+      picking_progress: entry.picking_progress,
+      is_batch_entry: entry.is_batch_entry
+    } : null,
+    batch: {
+      total_batches: batches.length,
+      in_garden_batches: inGarden.length,
+      in_garden_count: inGarden.reduce((s, b) => s + b.batch_count, 0),
+      batches
+    },
+    family: {
+      total: family.length,
+      checked_in: checkedIn,
+      arrival_rate: family.length > 0 ? checkedIn / family.length : null,
+      list: family
+    },
+    extras: extra ? {
+      addon_cost: extra.addon_cost,
+      extra_weight_charge: extra.extra_weight_charge,
+      damage_charge: extra.damage_charge,
+      total: Math.round((extra.addon_cost + extra.extra_weight_charge + extra.damage_charge) * 100) / 100
+    } : null,
+    addons: addons.map(a => ({
+      addon_order_no: a.addon_order_no,
+      items: JSON.parse(a.items || '[]'),
+      total_amount: a.total_amount,
+      payment_status: a.payment_status,
+      source: a.source
+    }))
+  }});
 });
 
 module.exports = router;

@@ -279,4 +279,303 @@ router.delete('/visitor-blacklist/:id', (req, res) => {
   res.json({ code: 0 });
 });
 
+// ===== 果区单独闭园管理 =====
+router.post('/zone-closure', (req, res) => {
+  const { zone_id, closure_date, reason, operator } = req.body;
+  if (!zone_id || !closure_date) return res.json({ code: 400, message: '果区和日期必填' });
+  const record = store.insert('closure_record', {
+    closure_no: `ZC-${Date.now()}`,
+    zone_id: Number(zone_id),
+    closure_date,
+    reason: reason || '临时关闭',
+    operator: operator || '管理员',
+    status: 'ACTIVE',
+    closed_at: nowDateTime()
+  });
+  res.json({ code: 0, data: record });
+});
+
+router.get('/zone-closure', (req, res) => {
+  const { zone_id, closure_date, status } = req.query;
+  let list = store.getAll('closure_record');
+  if (zone_id) list = list.filter(c => c.zone_id === Number(zone_id));
+  if (closure_date) list = list.filter(c => c.closure_date === closure_date);
+  if (status) list = list.filter(c => c.status === status);
+  res.json({ code: 0, data: list });
+});
+
+router.put('/zone-closure/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const { status } = req.body;
+  const record = store.update('closure_record', id, { status: status || 'INACTIVE' });
+  res.json({ code: 0, data: record });
+});
+
+// ===== 成熟度调整(触发重算) =====
+router.put('/maturity-versions/:id/adjust', (req, res) => {
+  const id = Number(req.params.id);
+  const { maturity_level, estimated_weight, operator, auto_recalc } = req.body;
+  const version = store.getById('maturity_version', id);
+  if (!version) return res.json({ code: 404, message: '批次不存在' });
+
+  const updates = {};
+  if (maturity_level != null) updates.maturity_level = Number(maturity_level);
+  if (estimated_weight != null) updates.estimated_weight = Number(estimated_weight);
+  if (updates.maturity_level != null && updates.estimated_weight != null) {
+    updates.ripe_weight = Math.round(Number(updates.estimated_weight) * (Number(updates.maturity_level) / 100));
+    updates.available_weight = updates.ripe_weight;
+  } else if (updates.maturity_level != null) {
+    updates.ripe_weight = Math.round(version.estimated_weight * (Number(updates.maturity_level) / 100));
+    updates.available_weight = updates.ripe_weight;
+  } else if (updates.estimated_weight != null) {
+    updates.ripe_weight = Math.round(Number(updates.estimated_weight) * ((version.maturity_level || 0) / 100));
+    updates.available_weight = updates.ripe_weight;
+  }
+  const record = store.update('maturity_version', id, updates);
+
+  let recalcResult = null;
+  if (auto_recalc !== false) {
+    recalcResult = recalcAfterMaturityChange(id, operator || '管理员');
+  }
+
+  res.json({ code: 0, data: { version: record, recalc: recalcResult } });
+});
+
+// 批量触发候补晋升
+router.post('/waitlist/promote', (req, res) => {
+  const { slot_id, max_count, operator } = req.body;
+  if (!slot_id) return res.json({ code: 400, message: '时段必填' });
+  const result = processWaitlistPromotion(Number(slot_id), Number(max_count) || 3);
+  res.json({ code: result.success ? 0 : 400, message: result.message, data: result });
+});
+
+// 候补列表管理
+router.get('/waitlist', (req, res) => {
+  const { slot_id, status, visitor_phone } = req.query;
+  let list = store.getAll('waitlist');
+  if (slot_id) list = list.filter(w => w.slot_id === Number(slot_id));
+  if (status) list = list.filter(w => w.status === status);
+  if (visitor_phone) list = list.filter(w => w.visitor_phone === visitor_phone);
+  list = list.sort((a, b) => (b.id || 0) - (a.id || 0));
+  res.json({ code: 0, data: list });
+});
+
+router.put('/waitlist/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const { status, operator } = req.body;
+  const record = store.update('waitlist', id, {
+    status: status || 'CANCELLED',
+    handled_by: operator || '管理员',
+    handled_at: nowDateTime()
+  });
+  res.json({ code: 0, data: record });
+});
+
+// 候补手动转为预约
+router.post('/waitlist/:id/convert', (req, res) => {
+  const id = Number(req.params.id);
+  const { operator } = req.body;
+  const waiter = store.getById('waitlist', id);
+  if (!waiter) return res.json({ code: 404, message: '候补记录不存在' });
+  if (waiter.status === 'CONVERTED' || waiter.status === 'CANCELLED') {
+    return res.json({ code: 400, message: `候补状态为${waiter.status}，无法转换` });
+  }
+
+  const slot = store.getById('time_slot', waiter.slot_id);
+  if (!slot) return res.json({ code: 404, message: '时段不存在' });
+  const ticket = store.getById('picking_ticket', waiter.ticket_id);
+  if (!ticket) return res.json({ code: 404, message: '票种不存在' });
+
+  const gs = waiter.group_size || 1;
+  const weightInfo = calcTicketWeight(waiter.ticket_id, gs);
+  const availWeight = calcSlotAvailableWeight(waiter.slot_id);
+  const availCap = Math.max(0, (slot.max_capacity || 0) - (slot.reserved_count || 0));
+
+  if (availCap < gs) return res.json({ code: 4103, message: '时段容量不足' });
+  if (availWeight < weightInfo.estimated) return res.json({ code: 4105, message: '果量不足' });
+
+  const lockResult = tryLockWeight(waiter.slot_id, weightInfo.estimated, null);
+  if (!lockResult.success) return res.json({ code: 4105, message: lockResult.message });
+
+  const reservation = store.insert('reservation', {
+    reservation_no: `RE-WL-${Date.now()}`,
+    visitor_phone: waiter.visitor_phone,
+    visitor_name: waiter.visitor_name,
+    visitor_type: waiter.visitor_type || 'ADULT',
+    visitor_idcard: waiter.visitor_idcard || null,
+    slot_id: waiter.slot_id,
+    ticket_id: waiter.ticket_id,
+    group_size: gs,
+    adult_count: waiter.adult_count || gs,
+    child_count: waiter.child_count || 0,
+    estimated_weight: weightInfo.estimated,
+    included_weight: weightInfo.included,
+    extra_weight_limit: weightInfo.extraLimit,
+    total_amount: Math.round(ticket.price * gs * 100) / 100,
+    deposit_amount: Math.round(ticket.deposit * gs * 100) / 100,
+    payable_total: Math.round((ticket.price + ticket.deposit) * gs * 100) / 100,
+    payment_status: 'PENDING_WAIVER',
+    status: 'CONFIRMED',
+    locked_weight: weightInfo.estimated,
+    lock_details: JSON.stringify(lockResult.lockedDetails),
+    remark: `候补转正(${waiter.waitlist_no})`,
+    source: 'WAITLIST',
+    waitlist_id: id
+  });
+
+  store.update('time_slot', slot.id, { reserved_count: (slot.reserved_count || 0) + gs });
+  store.update('waitlist', id, {
+    status: 'CONVERTED',
+    converted_to_reservation_id: reservation.id,
+    converted_at: nowDateTime(),
+    converted_by: operator || '管理员'
+  });
+
+  store.insert('deposit_record', {
+    deposit_no: `DP-WL-${Date.now()}`,
+    reservation_id: reservation.id,
+    visitor_phone: waiter.visitor_phone,
+    original_amount: reservation.deposit_amount,
+    paid_amount: 0,
+    paid_at: null,
+    remaining_amount: reservation.deposit_amount,
+    status: 'PENDING_PAY',
+    waitlist_source: id
+  });
+
+  syncStateToAll(reservation.id, 'ADMIN_WAITLIST_CONVERT', operator || '管理员');
+
+  res.json({ code: 0, data: { reservation, waitlist_id: id } });
+});
+
+// ===== 加购服务配置 =====
+router.get('/addon-services', (req, res) => {
+  const { status } = req.query;
+  let list = store.getAll('addon_service');
+  if (status) list = list.filter(s => s.status === status);
+  res.json({ code: 0, data: list });
+});
+
+router.post('/addon-services', (req, res) => {
+  const {
+    service_code, service_name, service_type, unit_price, unit,
+    description, available_zones, min_quantity, max_quantity, valid_from, valid_to, status
+  } = req.body;
+  if (!service_code || !service_name || !service_type || unit_price == null) {
+    return res.json({ code: 400, message: '必要字段缺失' });
+  }
+  const record = store.insert('addon_service', {
+    service_code, service_name, service_type,
+    unit_price: Number(unit_price) || 0,
+    unit: unit || '份',
+    description: description || '',
+    available_zones: Array.isArray(available_zones) ? JSON.stringify(available_zones) : (available_zones || '[]'),
+    min_quantity: Number(min_quantity) || 1,
+    max_quantity: Number(max_quantity) || 99,
+    valid_from: valid_from || nowDate(),
+    valid_to: valid_to || '2026-12-31',
+    status: status || 'ACTIVE'
+  });
+  res.json({ code: 0, data: record });
+});
+
+router.put('/addon-services/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const updates = { ...req.body };
+  if (Array.isArray(updates.available_zones)) {
+    updates.available_zones = JSON.stringify(updates.available_zones);
+  }
+  const record = store.update('addon_service', id, updates);
+  if (!record) return res.json({ code: 404, message: '服务不存在' });
+  res.json({ code: 0, data: record });
+});
+
+router.delete('/addon-services/:id', (req, res) => {
+  const id = Number(req.params.id);
+  store.update('addon_service', id, { status: 'INACTIVE' });
+  res.json({ code: 0 });
+});
+
+// ===== 分批入园配置 =====
+router.get('/batch-entries', (req, res) => {
+  const { slot_id, status } = req.query;
+  let list = store.getAll('batch_entry');
+  if (slot_id) list = list.filter(b => b.slot_id === Number(slot_id));
+  if (status) list = list.filter(b => b.status === status);
+  res.json({ code: 0, data: list });
+});
+
+router.post('/batch-entries', (req, res) => {
+  const {
+    slot_id, group_name, allocated_size, batch_count,
+    interval_minutes, start_time, contact_phone, operator
+  } = req.body;
+  if (!slot_id || !allocated_size) return res.json({ code: 400, message: '时段和分配人数必填' });
+
+  const slot = store.getById('time_slot', Number(slot_id));
+  if (!slot) return res.json({ code: 404, message: '时段不存在' });
+
+  const existingUsed = store.find('batch_entry', b =>
+    b.slot_id === Number(slot_id) && b.status === 'ACTIVE'
+  ).reduce((s, b) => s + (b.allocated_size || 0), 0);
+
+  const remaining = Math.max(0, (slot.max_capacity || 0) - (slot.reserved_count || 0) - existingUsed);
+  if (Number(allocated_size) > remaining) {
+    return res.json({ code: 400, message: `剩余可分配${remaining}人，请求${allocated_size}人` });
+  }
+
+  const record = store.insert('batch_entry', {
+    batch_no: `BE-${Date.now()}`,
+    slot_id: Number(slot_id),
+    group_name: group_name || `团体${Date.now()}`,
+    allocated_size: Number(allocated_size),
+    batch_count: Number(batch_count) || 1,
+    interval_minutes: Number(interval_minutes) || 15,
+    start_time: start_time || slot.slot_start,
+    contact_phone: contact_phone || '',
+    created_by: operator || '管理员',
+    status: 'ACTIVE',
+    confirmed_count: 0,
+    created_at: nowDateTime()
+  });
+
+  res.json({ code: 0, data: record });
+});
+
+router.put('/batch-entries/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const record = store.update('batch_entry', id, req.body);
+  res.json({ code: 0, data: record });
+});
+
+// 成熟度调整日志
+router.get('/weight-adjust-logs', (req, res) => {
+  const { version_id, zone_id } = req.query;
+  let list = store.getAll('weight_adjust_log');
+  if (version_id) list = list.filter(l => l.version_id === Number(version_id));
+  if (zone_id) list = list.filter(l => l.zone_id === Number(zone_id));
+  list = list.sort((a, b) => (b.id || 0) - (a.id || 0));
+  res.json({ code: 0, data: list });
+});
+
+// 状态同步日志
+router.get('/state-sync-logs', (req, res) => {
+  const { reservation_id, source } = req.query;
+  let list = store.getAll('state_sync_log');
+  if (reservation_id) list = list.filter(l => l.reservation_id === Number(reservation_id));
+  if (source) list = list.filter(l => l.source === source);
+  list = list.sort((a, b) => (b.id || 0) - (a.id || 0)).slice(0, 100);
+  res.json({ code: 0, data: list });
+});
+
+// 改期记录
+router.get('/reschedule-records', (req, res) => {
+  const { reservation_id, status } = req.query;
+  let list = store.getAll('reschedule_record');
+  if (reservation_id) list = list.filter(r => r.reservation_id === Number(reservation_id));
+  if (status) list = list.filter(r => r.status === status);
+  list = list.sort((a, b) => (b.id || 0) - (a.id || 0));
+  res.json({ code: 0, data: list });
+});
+
 module.exports = router;

@@ -243,4 +243,391 @@ router.get('/overview', (req, res) => {
   }});
 });
 
+// 候补队列可视化
+router.get('/waitlist-dashboard', (req, res) => {
+  const { date } = req.query;
+  const targetDate = date || nowDate();
+
+  const slots = store.find('time_slot', s => !date || s.slot_date === targetDate);
+  const slotIds = slots.map(s => s.id);
+
+  const allWaitlist = store.find('waitlist', w => slotIds.includes(w.slot_id));
+  const tickets = store.getAll('picking_ticket');
+  const ticketMap = new Map(tickets.map(t => [t.id, t]));
+
+  const slotWaitlist = slots.map(s => {
+    const wl = allWaitlist.filter(w => w.slot_id === s.id);
+    const waiting = wl.filter(w => w.status === 'WAITING');
+    const promoted = wl.filter(w => w.status === 'PROMOTED');
+    const converted = wl.filter(w => w.status === 'CONVERTED');
+    const cancelled = wl.filter(w => w.status === 'CANCELLED');
+    const waitingWeight = waiting.reduce((s, w) => s + (w.estimated_weight || 0), 0);
+    const waitingCapacity = waiting.reduce((s, w) => s + (w.group_size || 0), 0);
+
+    return {
+      slot_id: s.id,
+      slot_date: s.slot_date,
+      slot_label: s.slot_label,
+      slot_status: s.status,
+      max_capacity: s.max_capacity,
+      reserved_count: s.reserved_count || 0,
+      available_capacity: Math.max(0, s.max_capacity - (s.reserved_count || 0)),
+      total: wl.length,
+      waiting_count: waiting.length,
+      promoted_count: promoted.length,
+      converted_count: converted.length,
+      cancelled_count: cancelled.length,
+      waiting_capacity: waitingCapacity,
+      waiting_weight: Math.round(waitingWeight * 100) / 100,
+      queue: waiting
+        .sort((a, b) => a.queue_position - b.queue_position)
+        .slice(0, 10)
+        .map(w => ({
+          id: w.id,
+          waitlist_no: w.waitlist_no,
+          visitor_name: w.visitor_name,
+          visitor_phone: w.visitor_phone,
+          group_size: w.group_size,
+          estimated_weight: w.estimated_weight,
+          queue_position: w.queue_position,
+          created_at: w.created_at,
+          ticket_name: ticketMap.get(w.ticket_id)?.ticket_name || ''
+        }))
+    };
+  });
+
+  const summary = {
+    total_slots: slots.length,
+    closure_slots: slots.filter(s => s.status === 'CLOSURE').length,
+    total_waitlist: allWaitlist.length,
+    total_waiting: allWaitlist.filter(w => w.status === 'WAITING').length,
+    total_promoted: allWaitlist.filter(w => w.status === 'PROMOTED').length,
+    total_converted: allWaitlist.filter(w => w.status === 'CONVERTED').length,
+    total_cancelled: allWaitlist.filter(w => w.status === 'CANCELLED').length,
+    convert_rate: allWaitlist.length > 0
+      ? Math.round(allWaitlist.filter(w => w.status === 'CONVERTED').length / allWaitlist.length * 100)
+      : 0
+  };
+
+  res.json({ code: 0, data: { date: targetDate, summary, slots: slotWaitlist } });
+});
+
+// 分批入园进度
+router.get('/batch-entry-dashboard', (req, res) => {
+  const { date, slot_id } = req.query;
+  const targetDate = date || nowDate();
+
+  let slots = store.find('time_slot', s => !date || s.slot_date === targetDate);
+  if (slot_id) slots = slots.filter(s => s.id === Number(slot_id));
+  const slotIds = slots.map(s => s.id);
+
+  const reservations = store.find('reservation', r => slotIds.includes(r.slot_id));
+  const resIds = reservations.map(r => r.id);
+  const allBatches = store.find('batch_entry', b => resIds.includes(b.reservation_id));
+  const allEntries = store.find('entry_record', e => resIds.includes(e.reservation_id));
+  const entryMap = new Map(allEntries.map(e => [e.id, e]));
+
+  const resMap = new Map(reservations.map(r => [
+    r.id,
+    {
+      id: r.id,
+      reservation_no: r.reservation_no,
+      visitor_name: r.visitor_name,
+      group_size: r.group_size,
+      slot_id: r.slot_id
+    }
+  ]));
+
+  const slotData = slots.map(s => {
+    const slotResIds = reservations.filter(r => r.slot_id === s.id).map(r => r.id);
+    const slotBatches = allBatches.filter(b => slotResIds.includes(b.reservation_id));
+    const inGarden = slotBatches.filter(b => b.entry_status === 'IN_GARDEN');
+    const left = slotBatches.filter(b => b.entry_status === 'LEFT');
+
+    const batchByReservation = {};
+    for (const b of slotBatches) {
+      if (!batchByReservation[b.reservation_id]) {
+        const r = resMap.get(b.reservation_id);
+        batchByReservation[b.reservation_id] = {
+          reservation: r,
+          batches: [],
+          in_count: 0,
+          left_count: 0,
+          total_count: 0
+        };
+      }
+      batchByReservation[b.reservation_id].batches.push({
+        ...b,
+        entry_record: entryMap.get(b.entry_record_id) || null
+      });
+      if (b.entry_status === 'IN_GARDEN') {
+        batchByReservation[b.reservation_id].in_count += b.batch_count;
+      } else {
+        batchByReservation[b.reservation_id].left_count += b.batch_count;
+      }
+      batchByReservation[b.reservation_id].total_count += b.batch_count;
+    }
+
+    return {
+      slot_id: s.id,
+      slot_date: s.slot_date,
+      slot_label: s.slot_label,
+      max_capacity: s.max_capacity,
+      entered_count: s.entered_count || 0,
+      batch_groups: Object.values(batchByReservation).map(g => ({
+        ...g,
+        remaining: (g.reservation?.group_size || 0) - g.total_count
+      }))
+    };
+  });
+
+  const summary = {
+    total_batch_groups: allBatches.filter((v, i, a) =>
+      a.findIndex(x => x.reservation_id === v.reservation_id) === i
+    ).length,
+    total_batches: allBatches.length,
+    in_garden_batches: allBatches.filter(b => b.entry_status === 'IN_GARDEN').length,
+    in_garden_count: allBatches.filter(b => b.entry_status === 'IN_GARDEN')
+      .reduce((s, b) => s + b.batch_count, 0),
+    left_batches: allBatches.filter(b => b.entry_status === 'LEFT').length,
+    left_count: allBatches.filter(b => b.entry_status === 'LEFT')
+      .reduce((s, b) => s + b.batch_count, 0)
+  };
+
+  res.json({ code: 0, data: { date: targetDate, summary, slots: slotData } });
+});
+
+// 加购收入统计
+router.get('/addon-revenue', (req, res) => {
+  const { start_date, end_date, group_by } = req.query;
+  const targetDate = nowDate();
+  const startDate = start_date || targetDate;
+  const endDate = end_date || targetDate;
+
+  const allAddonOrders = store.find('addon_order', a => {
+    const d = (a.created_at || '').substring(0, 10);
+    return d >= startDate && d <= endDate;
+  });
+
+  const allOnSiteExtra = store.find('on_site_extra', o => {
+    const d = (o.updated_at || o.created_at || '').substring(0, 10);
+    return d >= startDate && d <= endDate;
+  });
+
+  const services = store.getAll('addon_service');
+  const svcMap = new Map(services.map(s => [s.id, s]));
+
+  const serviceStats = {};
+  let orderRevenue = 0;
+  let addonCostTotal = 0;
+  let extraChargeTotal = 0;
+  let damageChargeTotal = 0;
+
+  for (const order of allAddonOrders) {
+    orderRevenue += order.total_amount || 0;
+    try {
+      const items = JSON.parse(order.items || '[]');
+      for (const it of items) {
+        const key = it.service_code || `SVC_${it.service_id}`;
+        if (!serviceStats[key]) {
+          serviceStats[key] = {
+            service_code: it.service_code,
+            service_name: it.service_name,
+            service_type: it.service_type,
+            count: 0,
+            quantity: 0,
+            amount: 0
+          };
+        }
+        serviceStats[key].count++;
+        serviceStats[key].quantity += it.quantity || 0;
+        serviceStats[key].amount += it.sub_total || 0;
+      }
+    } catch (e) {}
+  }
+
+  for (const extra of allOnSiteExtra) {
+    addonCostTotal += extra.addon_cost || 0;
+    extraChargeTotal += extra.extra_weight_charge || 0;
+    damageChargeTotal += extra.damage_charge || 0;
+  }
+
+  const data = {
+    date_range: { start_date: startDate, end_date: endDate },
+    order_count: allAddonOrders.length,
+    order_revenue: Math.round(orderRevenue * 100) / 100,
+    onsite_addon_cost: Math.round(addonCostTotal * 100) / 100,
+    onsite_extra_weight_charge: Math.round(extraChargeTotal * 100) / 100,
+    onsite_damage_charge: Math.round(damageChargeTotal * 100) / 100,
+    onsite_total: Math.round((addonCostTotal + extraChargeTotal + damageChargeTotal) * 100) / 100,
+    service_breakdown: Object.values(serviceStats).sort((a, b) => b.amount - a.amount)
+  };
+
+  res.json({ code: 0, data });
+});
+
+// 改期记录统计
+router.get('/reschedule-stats', (req, res) => {
+  const { start_date, end_date } = req.query;
+  const targetDate = nowDate();
+  const startDate = start_date || targetDate;
+  const endDate = end_date || targetDate;
+
+  const records = store.find('reschedule_record', r => {
+    const d = (r.executed_at || '').substring(0, 10);
+    return d >= startDate && d <= endDate;
+  });
+
+  const byReason = {};
+  const byOperator = {};
+  const byDate = {};
+
+  for (const r of records) {
+    const reason = r.reason || '未说明';
+    const oper = r.operator || 'system';
+    const d = (r.executed_at || '').substring(0, 10);
+
+    if (!byReason[reason]) byReason[reason] = 0;
+    byReason[reason]++;
+
+    if (!byOperator[oper]) byOperator[oper] = 0;
+    byOperator[oper]++;
+
+    if (!byDate[d]) byDate[d] = 0;
+    byDate[d]++;
+  }
+
+  res.json({ code: 0, data: {
+    date_range: { start_date: startDate, end_date: endDate },
+    total_count: records.length,
+    recent_records: records.sort((a, b) => (b.id || 0) - (a.id || 0)).slice(0, 20),
+    by_reason: Object.entries(byReason).map(([k, v]) => ({ reason: k, count: v }))
+      .sort((a, b) => b.count - a.count),
+    by_operator: Object.entries(byOperator).map(([k, v]) => ({ operator: k, count: v }))
+      .sort((a, b) => b.count - a.count),
+    by_date: Object.entries(byDate).map(([k, v]) => ({ date: k, count: v }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+  }});
+});
+
+// 三端统一状态看板
+router.get('/state-dashboard', (req, res) => {
+  const { date, limit } = req.query;
+  const targetDate = date || nowDate();
+  const lim = Math.min(Number(limit) || 50, 200);
+
+  const slots = store.find('time_slot', s => s.slot_date === targetDate);
+  const slotIds = slots.map(s => s.id);
+
+  const reservations = store.find('reservation', r => slotIds.includes(r.slot_id))
+    .sort((a, b) => (b.id || 0) - (a.id || 0)).slice(0, lim);
+
+  const tickets = store.getAll('picking_ticket');
+  const ticketMap = new Map(tickets.map(t => [t.id, t]));
+  const slotMap = new Map(slots.map(s => [s.id, s]));
+
+  const resIds = reservations.map(r => r.id);
+  const entries = store.find('entry_record', e => resIds.includes(e.reservation_id));
+  const entryMap = new Map(entries.map(e => [e.reservation_id, e]));
+  const deposits = store.find('deposit_record', d => resIds.includes(d.reservation_id));
+  const depositMap = new Map(deposits.map(d => [d.reservation_id, d]));
+  const waitlists = store.find('waitlist', w => slotIds.includes(w.slot_id));
+  const wlCountBySlot = {};
+  for (const w of waitlists) {
+    if (w.status === 'WAITING') {
+      wlCountBySlot[w.slot_id] = (wlCountBySlot[w.slot_id] || 0) + 1;
+    }
+  }
+
+  const lastSyncs = {};
+  const syncLogs = store.find('state_sync_log', l => resIds.includes(l.reservation_id))
+    .sort((a, b) => (b.id || 0) - (a.id || 0));
+  for (const log of syncLogs) {
+    if (!lastSyncs[log.reservation_id]) {
+      lastSyncs[log.reservation_id] = log;
+    }
+  }
+
+  const data = reservations.map(r => {
+    const slot = slotMap.get(r.slot_id);
+    const ticket = ticketMap.get(r.ticket_id);
+    const entry = entryMap.get(r.id);
+    const deposit = depositMap.get(r.id);
+    const lastSync = lastSyncs[r.id];
+    let state = {
+      reservation_status: r.status,
+      entry_status: entry?.entry_status || 'NOT_ENTERED',
+      deposit_status: deposit?.status || 'NONE',
+      waitlist_here: wlCountBySlot[r.slot_id] || 0
+    };
+    try {
+      if (lastSync?.state_snapshot) {
+        state = { ...state, ...JSON.parse(lastSync.state_snapshot) };
+      }
+    } catch (e) {}
+
+    return {
+      reservation: {
+        id: r.id,
+        reservation_no: r.reservation_no,
+        status: r.status,
+        visitor_name: r.visitor_name,
+        visitor_phone: r.visitor_phone,
+        group_size: r.group_size,
+        estimated_weight: r.estimated_weight,
+        included_weight: r.included_weight,
+        total_amount: r.total_amount,
+        deposit_amount: r.deposit_amount,
+        refund_amount: r.refund_amount,
+        reschedule_count: r.reschedule_count || 0,
+        actual_picked_weight: r.actual_picked_weight
+      },
+      ticket: ticket ? {
+        ticket_code: ticket.ticket_code, ticket_name: ticket.ticket_name
+      } : null,
+      slot: slot ? {
+        slot_date: slot.slot_date, slot_label: slot.slot_label,
+        slot_status: slot.status
+      } : null,
+      entry: entry ? {
+        entry_status: entry.entry_status,
+        entry_time: entry.entry_time,
+        leave_time: entry.leave_time,
+        actual_picked_weight: entry.actual_picked_weight,
+        picking_progress: entry.picking_progress
+      } : null,
+      deposit: deposit ? {
+        original_amount: deposit.original_amount,
+        remaining_amount: deposit.remaining_amount,
+        refunded_amount: deposit.refunded_amount,
+        deducted_amount: deposit.deducted_amount,
+        status: deposit.status
+      } : null,
+      unified_state: state,
+      last_sync: lastSync ? {
+        source: lastSync.source,
+        operator: lastSync.operator,
+        synced_at: lastSync.synced_at
+      } : null,
+      state_in_sync: !!lastSync
+    };
+  });
+
+  const summary = {
+    date: targetDate,
+    total_reservations: reservations.length,
+    by_status: {
+      confirmed: reservations.filter(r => r.status === 'CONFIRMED').length,
+      cancelled: reservations.filter(r => r.status === 'CANCELLED').length,
+      completed: reservations.filter(r => r.status === 'COMPLETED').length
+    },
+    in_garden: entries.filter(e => e.entry_status === 'IN_GARDEN').length,
+    total_waitlist: Object.values(wlCountBySlot).reduce((s, v) => s + v, 0),
+    synced_count: data.filter(d => d.state_in_sync).length,
+    sync_rate: data.length > 0 ? Math.round(data.filter(d => d.state_in_sync).length / data.length * 100) : 0
+  };
+
+  res.json({ code: 0, data: { summary, list: data } });
+});
+
 module.exports = router;
